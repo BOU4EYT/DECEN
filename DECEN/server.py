@@ -21,7 +21,9 @@ from pathlib import Path
 from typing import Any
 
 import websockets
+from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
+from websockets.http11 import Request, Response
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_HOST = os.environ.get("DECEN_HOST", "localhost")
@@ -175,6 +177,51 @@ def validate_room_name(name: str) -> str | None:
     return None
 
 
+def landing_page() -> str:
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DECEN Server</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #080b12; color: #f5f7fb; }
+    main { width: min(760px, calc(100% - 40px)); padding: 40px; border: 1px solid #263043; border-radius: 24px; background: linear-gradient(145deg, #111827, #0b1020); box-shadow: 0 20px 60px #0008; }
+    h1 { margin-top: 0; font-size: clamp(2rem, 6vw, 4rem); letter-spacing: .08em; }
+    code, pre { background: #020617; color: #93c5fd; border-radius: 10px; }
+    code { padding: .2rem .4rem; }
+    pre { overflow-x: auto; padding: 18px; }
+    a { color: #67e8f9; }
+    .status { display: inline-flex; gap: .5rem; align-items: center; color: #86efac; font-weight: 700; }
+    .dot { width: .7rem; height: .7rem; border-radius: 999px; background: #22c55e; box-shadow: 0 0 20px #22c55e; }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="status"><span class="dot"></span> DECEN websocket server online</p>
+    <h1>D.E.C.E.N.</h1>
+    <p>This address is a websocket endpoint for the DECEN terminal chat client. Browsers cannot chat here by opening the URL directly, but the server is running.</p>
+    <p>Connect from your machine with:</p>
+    <pre><code>python DECEN/main.py --url wss://YOUR-FLY-APP.fly.dev</code></pre>
+    <p>For local testing, run:</p>
+    <pre><code>python DECEN/server.py
+python DECEN/main.py --server local</code></pre>
+  </main>
+</body>
+</html>
+"""
+
+
+def http_response(status: int, reason: str, body: str, content_type: str) -> Response:
+    encoded = body.encode("utf-8")
+    headers = Headers()
+    headers["Content-Type"] = content_type
+    headers["Content-Length"] = str(len(encoded))
+    headers["Cache-Control"] = "no-store"
+    return Response(status, reason, headers, encoded)
+
+
 # =========================
 # CHAT SERVER
 # =========================
@@ -187,6 +234,13 @@ class ChatServer:
 
     def __post_init__(self) -> None:
         self.rooms[DEFAULT_ROOM] = ChatRoom(name=DEFAULT_ROOM, topic="Welcome to DECEN")
+
+    def process_request(self, _: Any, request: Request) -> Response | None:
+        if request.headers.get("Upgrade", "").lower() == "websocket":
+            return None
+        if request.path == "/healthz":
+            return http_response(200, "OK", "ok\n", "text/plain; charset=utf-8")
+        return http_response(200, "OK", landing_page(), "text/html; charset=utf-8")
 
     async def handler(self, websocket: Any) -> None:
         logging.info("Client connected from %s", websocket.remote_address)
@@ -627,7 +681,9 @@ async def main() -> None:
     store.load()
     server = ChatServer(store)
 
-    async with websockets.serve(server.handler, args.host, args.port):
+    async with websockets.serve(
+        server.handler, args.host, args.port, process_request=server.process_request
+    ):
         logging.info("DECEN Server running on ws://%s:%s", args.host, args.port)
         logging.info("Using data directory: %s", store.data_dir)
         await asyncio.Future()

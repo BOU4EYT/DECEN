@@ -135,6 +135,10 @@ Fly.io's `[http_service]` format so websocket upgrades work without the older
    python DECEN/main.py --url wss://your-decen-app.fly.dev
    ```
 
+If you open `https://your-decen-app.fly.dev` in a browser, DECEN now shows a
+small status/help page. Chat still requires the terminal client because the chat
+protocol runs over websockets.
+
 ### Fly.io web launch/customize sessions
 
 If you deploy through a Fly.io web launch/customize flow and see an error like
