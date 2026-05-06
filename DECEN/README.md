@@ -105,7 +105,9 @@ environment variable.
 ## Deploy the main server on Fly.io
 
 This repo includes a `Dockerfile` and `fly.toml` for Fly.io. The default config
-runs `DECEN/server.py` on port `8080` and stores user data in `/data`.
+runs `DECEN/server.py` on port `8080`, stores user data in `/data`, and uses
+Fly.io's `[http_service]` format so websocket upgrades work without the older
+`[[services.ports]]` manifest shape.
 
 1. Install and sign in to the Fly CLI.
 2. Pick a unique Fly app name and edit `fly.toml`:
