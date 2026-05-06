@@ -135,6 +135,15 @@ Fly.io's `[http_service]` format so websocket upgrades work without the older
    python DECEN/main.py --url wss://your-decen-app.fly.dev
    ```
 
+### Fly.io web launch/customize sessions
+
+If you deploy through a Fly.io web launch/customize flow and see an error like
+`LaunchManifest.config.Alias.services.ports of type int`, the customize session
+is parsing a different JSON shape than `fly.toml`. Use `.fly/customize.json` as
+the customize payload shape: its `services[].ports` value is an array of integer
+ports (`[80, 443]`), not an array of `{ port, handlers }` objects. For normal
+CLI deployments, keep using `fly.toml` and `fly deploy`.
+
 ## Data files
 
 By default, the server reads and writes `users.json` in the same directory as

@@ -1,0 +1,9 @@
+{
+  "services": [
+    {
+      "internal_port": 8080,
+      "protocol": "tcp",
+      "ports": [80, 443]
+    }
+  ]
+}
