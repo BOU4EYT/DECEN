@@ -1,7 +1,7 @@
 """DECEN websocket chat server.
 
 This module hosts the DECEN chat service and keeps all dependencies in the
-Python standard library plus ``websockets``.  It intentionally avoids global
+Python standard library plus ``websockets``. It intentionally avoids global
 runtime configuration so the server can be imported, tested, and started from
 custom entry points.
 """
@@ -24,11 +24,14 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 APP_DIR = Path(__file__).resolve().parent
-DEFAULT_HOST = "localhost"
-DEFAULT_PORT = 8765
+DEFAULT_HOST = os.environ.get("DECEN_HOST", "localhost")
+DEFAULT_PORT = int(os.environ.get("PORT", os.environ.get("DECEN_PORT", "8765")))
+DEFAULT_ROOM = "lobby"
 PASSWORD_ITERATIONS = 240_000
 MAX_MESSAGE_LENGTH = 1_000
 HISTORY_LIMIT = 50
+ROOM_NAME_MIN_LENGTH = 2
+ROOM_NAME_MAX_LENGTH = 32
 
 
 # =========================
@@ -136,13 +139,54 @@ class UserStore:
 
 
 # =========================
+# ROOMS
+# =========================
+@dataclass
+class ChatRoom:
+    name: str
+    admin_uid: str | None = None
+    created_by: str | None = None
+    created: int = field(default_factory=utc_timestamp)
+    members: set[Any] = field(default_factory=set)
+    history: list[str] = field(default_factory=list)
+    topic: str = ""
+
+    @property
+    def admin_label(self) -> str:
+        return self.created_by or "server"
+
+    def is_admin(self, user: dict[str, Any]) -> bool:
+        return self.admin_uid is not None and user.get("uid") == self.admin_uid
+
+    def append_history(self, message: str) -> None:
+        self.history.append(message)
+        del self.history[:-HISTORY_LIMIT]
+
+
+def normalize_room_name(name: str) -> str:
+    return name.strip().lower()
+
+
+def validate_room_name(name: str) -> str | None:
+    if not (ROOM_NAME_MIN_LENGTH <= len(name) <= ROOM_NAME_MAX_LENGTH):
+        return f"Room names must be {ROOM_NAME_MIN_LENGTH}-{ROOM_NAME_MAX_LENGTH} characters."
+    if not name.replace("_", "").replace("-", "").isalnum():
+        return "Room names may only contain letters, numbers, underscores, and hyphens."
+    return None
+
+
+# =========================
 # CHAT SERVER
 # =========================
 @dataclass
 class ChatServer:
     store: UserStore
     connected_clients: dict[Any, dict[str, Any]] = field(default_factory=dict)
-    history: list[str] = field(default_factory=list)
+    client_rooms: dict[Any, str] = field(default_factory=dict)
+    rooms: dict[str, ChatRoom] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.rooms[DEFAULT_ROOM] = ChatRoom(name=DEFAULT_ROOM, topic="Welcome to DECEN")
 
     async def handler(self, websocket: Any) -> None:
         logging.info("Client connected from %s", websocket.remote_address)
@@ -153,8 +197,12 @@ class ChatServer:
                 return
 
             self.connected_clients[websocket] = user
+            self.rooms[DEFAULT_ROOM].members.add(websocket)
+            self.client_rooms[websocket] = DEFAULT_ROOM
             await self.send_welcome(websocket, user, created)
-            await self.broadcast_system(f"{user['username']} joined DECEN.")
+            await self.broadcast_room_system(
+                DEFAULT_ROOM, f"{user['username']} joined."
+            )
 
             async for message in websocket:
                 await self.process_message(websocket, message)
@@ -166,7 +214,7 @@ class ChatServer:
         finally:
             user = self.connected_clients.pop(websocket, None)
             if user:
-                await self.broadcast_system(f"{user['username']} left DECEN.")
+                await self.leave_current_room(websocket, user, announce=True)
 
     async def authenticate(self, websocket: Any) -> tuple[dict[str, Any] | None, bool]:
         await websocket.send("USERNAME:")
@@ -204,13 +252,9 @@ class ChatServer:
         status = "ACCOUNT CREATED" if created else "AUTH SUCCESS"
         await websocket.send(f"{status} | UID: {user['uid']}")
         await websocket.send(
-            "SYSTEM | Type /help for commands, /who for online users, and /quit to exit."
+            "SYSTEM | You are in #lobby. Type /help for room and admin commands."
         )
-
-        if self.history:
-            await websocket.send("SYSTEM | Recent messages:")
-            for line in self.history[-10:]:
-                await websocket.send(line)
+        await self.send_room_history(websocket, DEFAULT_ROOM)
 
     async def process_message(self, websocket: Any, raw_message: str) -> None:
         sender = self.connected_clients.get(websocket)
@@ -232,33 +276,48 @@ class ChatServer:
             await self.handle_command(websocket, sender, message)
             return
 
-        formatted = f"[{utc_stamp()}] {sender['username']} ({sender['uid']}): {message}"
+        room_name = self.client_rooms.get(websocket, DEFAULT_ROOM)
+        formatted = (
+            f"[{utc_stamp()}] #{room_name} {sender['username']} "
+            f"({sender['uid']}): {message}"
+        )
         logging.info("Broadcast: %s", formatted)
-        self.history.append(formatted)
-        del self.history[:-HISTORY_LIMIT]
-        await self.broadcast(formatted)
+        self.rooms[room_name].append_history(formatted)
+        await self.broadcast_to_room(room_name, formatted)
 
     async def handle_command(
         self, websocket: Any, user: dict[str, Any], command: str
     ) -> None:
-        command_name = command.split(maxsplit=1)[0].lower()
+        command_name, _, argument = command.partition(" ")
+        command_name = command_name.lower()
+        argument = argument.strip()
 
         if command_name == "/help":
             await websocket.send(
-                "SYSTEM | Commands: /help, /who, /me <action>, /clear, /quit"
+                "SYSTEM | Commands: /help, /rooms, /room, /create <room>, "
+                "/join <room>, /leave, /who, /me <action>, /topic [text], "
+                "/kick <user>, /close, /clear, /quit"
             )
+        elif command_name == "/rooms":
+            await self.send_room_list(websocket)
+        elif command_name == "/room":
+            await self.send_current_room(websocket)
+        elif command_name == "/create":
+            await self.create_room(websocket, user, argument)
+        elif command_name == "/join":
+            await self.join_room_command(websocket, argument)
+        elif command_name == "/leave":
+            await self.leave_room_command(websocket, user)
         elif command_name == "/who":
-            names = sorted(u["username"] for u in self.connected_clients.values())
-            await websocket.send(f"SYSTEM | Online ({len(names)}): {', '.join(names)}")
+            await self.send_room_members(websocket)
         elif command_name == "/me":
-            action = command.partition(" ")[2].strip()
-            if not action:
-                await websocket.send("SYSTEM | Usage: /me <action>")
-                return
-            formatted = f"[{utc_stamp()}] * {user['username']} {action}"
-            self.history.append(formatted)
-            del self.history[:-HISTORY_LIMIT]
-            await self.broadcast(formatted)
+            await self.send_action(websocket, user, argument)
+        elif command_name == "/topic":
+            await self.topic_command(websocket, user, argument)
+        elif command_name == "/kick":
+            await self.kick_user(websocket, user, argument)
+        elif command_name == "/close":
+            await self.close_room(websocket, user)
         elif command_name == "/clear":
             await websocket.send("\033cSYSTEM | Local screen cleared.")
         elif command_name == "/quit":
@@ -269,20 +328,263 @@ class ChatServer:
                 f"SYSTEM | Unknown command: {command_name}. Try /help."
             )
 
-    async def broadcast_system(self, message: str) -> None:
-        if self.connected_clients:
-            await self.broadcast(f"SYSTEM | {message}")
+    async def create_room(
+        self, websocket: Any, user: dict[str, Any], room_name: str
+    ) -> None:
+        room_name = normalize_room_name(room_name)
+        validation_error = validate_room_name(room_name)
+        if validation_error:
+            await websocket.send(f"SYSTEM | {validation_error}")
+            return
+        if room_name in self.rooms:
+            await websocket.send(
+                f"SYSTEM | Room #{room_name} already exists. Use /join {room_name}."
+            )
+            return
 
-    async def broadcast(self, message: str) -> None:
+        self.rooms[room_name] = ChatRoom(
+            name=room_name, admin_uid=user["uid"], created_by=user["username"]
+        )
+        await self.join_room(websocket, room_name)
+        await websocket.send(
+            f"SYSTEM | You created #{room_name} and are its admin. "
+            "Admin commands: /topic <text>, /kick <user>, /close."
+        )
+
+    async def join_room_command(self, websocket: Any, room_name: str) -> None:
+        room_name = normalize_room_name(room_name)
+        if not room_name:
+            await websocket.send("SYSTEM | Usage: /join <room>")
+            return
+        if room_name not in self.rooms:
+            await websocket.send(
+                f"SYSTEM | Room #{room_name} does not exist. Create it with /create {room_name}."
+            )
+            return
+        await self.join_room(websocket, room_name)
+
+    async def join_room(
+        self, websocket: Any, room_name: str, *, announce: bool = True
+    ) -> None:
+        user = self.connected_clients[websocket]
+        current_room = self.client_rooms.get(websocket)
+        if current_room == room_name:
+            await websocket.send(f"SYSTEM | You are already in #{room_name}.")
+            return
+
+        if current_room:
+            await self.leave_current_room(websocket, user, announce=announce)
+
+        room = self.rooms[room_name]
+        room.members.add(websocket)
+        self.client_rooms[websocket] = room_name
+        await websocket.send(f"SYSTEM | Joined #{room_name}.")
+        if room.topic:
+            await websocket.send(f"SYSTEM | Topic: {room.topic}")
+        await self.send_room_history(websocket, room_name)
+        if announce:
+            await self.broadcast_room_system(
+                room_name, f"{user['username']} joined #{room_name}."
+            )
+
+    async def leave_room_command(self, websocket: Any, user: dict[str, Any]) -> None:
+        current_room = self.client_rooms.get(websocket, DEFAULT_ROOM)
+        if current_room == DEFAULT_ROOM:
+            await websocket.send("SYSTEM | You are already in #lobby.")
+            return
+
+        await self.leave_current_room(websocket, user, announce=True)
+        await self.join_room(websocket, DEFAULT_ROOM, announce=False)
+
+    async def leave_current_room(
+        self, websocket: Any, user: dict[str, Any], *, announce: bool
+    ) -> None:
+        room_name = self.client_rooms.pop(websocket, None)
+        if room_name is None:
+            return
+
+        room = self.rooms.get(room_name)
+        if room is None:
+            return
+
+        room.members.discard(websocket)
+        if announce:
+            await self.broadcast_room_system(
+                room_name, f"{user['username']} left #{room_name}."
+            )
+
+        if room_name != DEFAULT_ROOM and not room.members:
+            self.rooms.pop(room_name, None)
+            logging.info("Removed empty room #%s", room_name)
+        elif room_name != DEFAULT_ROOM and room.admin_uid == user.get("uid"):
+            await self.transfer_admin(room)
+
+    async def transfer_admin(self, room: ChatRoom) -> None:
+        if not room.members:
+            return
+        new_admin_socket = next(iter(room.members))
+        new_admin = self.connected_clients[new_admin_socket]
+        room.admin_uid = new_admin["uid"]
+        room.created_by = new_admin["username"]
+        await self.broadcast_room_system(
+            room.name, f"{new_admin['username']} is now admin of #{room.name}."
+        )
+
+    async def send_room_list(self, websocket: Any) -> None:
+        lines = []
+        for name, room in sorted(self.rooms.items()):
+            marker = "*" if self.client_rooms.get(websocket) == name else " "
+            topic = f" | {room.topic}" if room.topic else ""
+            lines.append(
+                f"{marker} #{name} ({len(room.members)} online, admin: {room.admin_label}){topic}"
+            )
+        await websocket.send("SYSTEM | Rooms:\n" + "\n".join(lines))
+
+    async def send_current_room(self, websocket: Any) -> None:
+        room_name = self.client_rooms.get(websocket, DEFAULT_ROOM)
+        room = self.rooms[room_name]
+        await websocket.send(
+            f"SYSTEM | Current room: #{room_name} | admin: {room.admin_label} | "
+            f"online: {len(room.members)}"
+        )
+        if room.topic:
+            await websocket.send(f"SYSTEM | Topic: {room.topic}")
+
+    async def send_room_members(self, websocket: Any) -> None:
+        room_name = self.client_rooms.get(websocket, DEFAULT_ROOM)
+        room = self.rooms[room_name]
+        names = sorted(
+            self.connected_clients[client]["username"] for client in room.members
+        )
+        await websocket.send(
+            f"SYSTEM | #{room_name} online ({len(names)}): {', '.join(names)}"
+        )
+
+    async def send_action(
+        self, websocket: Any, user: dict[str, Any], action: str
+    ) -> None:
+        if not action:
+            await websocket.send("SYSTEM | Usage: /me <action>")
+            return
+        room_name = self.client_rooms.get(websocket, DEFAULT_ROOM)
+        formatted = f"[{utc_stamp()}] #{room_name} * {user['username']} {action}"
+        self.rooms[room_name].append_history(formatted)
+        await self.broadcast_to_room(room_name, formatted)
+
+    async def topic_command(
+        self, websocket: Any, user: dict[str, Any], topic: str
+    ) -> None:
+        room_name = self.client_rooms.get(websocket, DEFAULT_ROOM)
+        room = self.rooms[room_name]
+        if not topic:
+            await websocket.send(f"SYSTEM | Topic: {room.topic or 'No topic set.'}")
+            return
+        if not await self.require_room_admin(websocket, user, room):
+            return
+        room.topic = topic[:120]
+        await self.broadcast_room_system(room_name, f"Topic set to: {room.topic}")
+
+    async def kick_user(
+        self, websocket: Any, admin: dict[str, Any], username: str
+    ) -> None:
+        room_name = self.client_rooms.get(websocket, DEFAULT_ROOM)
+        room = self.rooms[room_name]
+        if not await self.require_room_admin(websocket, admin, room):
+            return
+        if room_name == DEFAULT_ROOM:
+            await websocket.send("SYSTEM | The lobby cannot use /kick.")
+            return
+        if not username:
+            await websocket.send("SYSTEM | Usage: /kick <username>")
+            return
+
+        target_socket = self.find_member_socket(room, username)
+        if target_socket is None:
+            await websocket.send(f"SYSTEM | {username} is not in #{room_name}.")
+            return
+        if target_socket == websocket:
+            await websocket.send(
+                "SYSTEM | Admins cannot kick themselves; use /leave or /close."
+            )
+            return
+
+        target_user = self.connected_clients[target_socket]
+        await self.leave_current_room(target_socket, target_user, announce=False)
+        await target_socket.send(
+            f"SYSTEM | You were removed from #{room_name} by {admin['username']}."
+        )
+        await self.join_room(target_socket, DEFAULT_ROOM, announce=False)
+        await self.broadcast_room_system(
+            room_name, f"{target_user['username']} was removed by an admin."
+        )
+
+    async def close_room(self, websocket: Any, user: dict[str, Any]) -> None:
+        room_name = self.client_rooms.get(websocket, DEFAULT_ROOM)
+        room = self.rooms[room_name]
+        if room_name == DEFAULT_ROOM:
+            await websocket.send("SYSTEM | The lobby cannot be closed.")
+            return
+        if not await self.require_room_admin(websocket, user, room):
+            return
+
+        members = list(room.members)
+        await self.broadcast_room_system(
+            room_name, f"#{room_name} was closed by {user['username']}."
+        )
+        for member in members:
+            member_user = self.connected_clients.get(member)
+            if member_user is None:
+                continue
+            self.client_rooms.pop(member, None)
+            room.members.discard(member)
+            await self.join_room(member, DEFAULT_ROOM, announce=False)
+        self.rooms.pop(room_name, None)
+
+    async def require_room_admin(
+        self, websocket: Any, user: dict[str, Any], room: ChatRoom
+    ) -> bool:
+        if room.is_admin(user):
+            return True
+        await websocket.send(
+            f"SYSTEM | Admin only. #{room.name} admin is {room.admin_label}."
+        )
+        return False
+
+    def find_member_socket(self, room: ChatRoom, username: str) -> Any | None:
+        username = username.lower()
+        for socket in room.members:
+            user = self.connected_clients.get(socket)
+            if user and user["username"].lower() == username:
+                return socket
+        return None
+
+    async def send_room_history(self, websocket: Any, room_name: str) -> None:
+        room = self.rooms[room_name]
+        if not room.history:
+            return
+        await websocket.send(f"SYSTEM | Recent messages in #{room_name}:")
+        for line in room.history[-10:]:
+            await websocket.send(line)
+
+    async def broadcast_room_system(self, room_name: str, message: str) -> None:
+        await self.broadcast_to_room(room_name, f"SYSTEM | {message}")
+
+    async def broadcast_to_room(self, room_name: str, message: str) -> None:
+        room = self.rooms.get(room_name)
+        if room is None:
+            return
+
         stale_clients: list[Any] = []
-        for client in list(self.connected_clients.keys()):
+        for client in list(room.members):
             try:
                 await client.send(message)
             except ConnectionClosed:
                 stale_clients.append(client)
 
         for client in stale_clients:
+            room.members.discard(client)
             self.connected_clients.pop(client, None)
+            self.client_rooms.pop(client, None)
 
 
 def validate_credentials(username: str, password: str) -> str | None:

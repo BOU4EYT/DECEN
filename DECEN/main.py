@@ -5,16 +5,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import os
 import sys
 import time
 from contextlib import suppress
 from typing import Any
 
 import websockets
-from websockets.exceptions import ConnectionClosed, InvalidURI, InvalidHandshake
+from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidURI
 
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8765
+DEFAULT_MAIN_SERVER = os.environ.get("DECEN_MAIN_SERVER", "wss://decen-main.fly.dev")
 
 
 # =========================
@@ -39,14 +41,55 @@ def show_boot_screen(animated: bool) -> None:
         print(subtitle)
 
     print("\nNetwork Status: Online")
-    print("Tip: type /help after login to see available commands.\n")
+    print("Tip: choose a server, then type /help after login for chatroom commands.\n")
 
 
 def client_help() -> str:
     return (
-        "Local shortcuts: /quit exits, Ctrl+C cancels, and blank messages are ignored.\n"
-        "Server commands: /help, /who, /me <action>, /clear."
+        "Local shortcuts: /quit exits, /exit and /q also quit, Ctrl+C cancels, "
+        "and blank messages are ignored.\n"
+        "Rooms: /rooms, /create <room>, /join <room>, /leave, /who.\n"
+        "Room admins: /topic <text>, /kick <user>, /close."
     )
+
+
+def prompt_server_choice() -> str:
+    print("Choose a DECEN server:")
+    print("  1) Main DECEN server")
+    print("  2) Local server on this machine")
+    print("  3) Custom/self-hosted server URL")
+
+    while True:
+        choice = input("Server [1/2/3]: ").strip()
+        if choice in {"", "1"}:
+            return "main"
+        if choice == "2":
+            return "local"
+        if choice == "3":
+            return "custom"
+        print("Please choose 1, 2, or 3.")
+
+
+def build_server_uri(args: argparse.Namespace) -> str:
+    if args.url:
+        return normalize_websocket_uri(args.url)
+
+    server_choice = args.server or prompt_server_choice()
+    if server_choice == "main":
+        return normalize_websocket_uri(args.main_url)
+    if server_choice == "custom":
+        custom_url = input("Websocket URL (ws:// or wss://): ").strip()
+        return normalize_websocket_uri(custom_url)
+    return f"ws://{args.host}:{args.port}"
+
+
+def normalize_websocket_uri(uri: str) -> str:
+    uri = uri.strip()
+    if not uri:
+        raise ValueError("Server URL cannot be empty.")
+    if uri.startswith(("ws://", "wss://")):
+        return uri
+    return f"wss://{uri}"
 
 
 # =========================
@@ -89,7 +132,11 @@ async def send_messages(websocket: Any) -> None:
 
 
 async def connect_to_server(args: argparse.Namespace) -> int:
-    uri = f"ws://{args.host}:{args.port}"
+    try:
+        uri = build_server_uri(args)
+    except ValueError as error:
+        print(f"Invalid server selection: {error}")
+        return 1
 
     try:
         async with websockets.connect(
@@ -131,7 +178,7 @@ async def connect_to_server(args: argparse.Namespace) -> int:
                 task.result()
 
     except (ConnectionRefusedError, OSError):
-        print(f"Could not connect to {uri}. Is the DECEN server running?")
+        print(f"Could not connect to {uri}. Is that DECEN server running?")
         return 1
     except (InvalidURI, InvalidHandshake) as error:
         print(f"Unable to open websocket connection: {error}")
@@ -149,8 +196,26 @@ async def connect_to_server(args: argparse.Namespace) -> int:
 # =========================
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Connect to a DECEN chat server.")
-    parser.add_argument("--host", default=DEFAULT_HOST, help="Server host/IP.")
-    parser.add_argument("--port", default=DEFAULT_PORT, type=int, help="Server port.")
+    parser.add_argument(
+        "--server",
+        choices=("main", "local", "custom"),
+        help="Server profile to use. Omit this to choose interactively.",
+    )
+    parser.add_argument(
+        "--url",
+        help="Direct websocket URL for any DECEN server, e.g. wss://example.fly.dev.",
+    )
+    parser.add_argument(
+        "--main-url",
+        default=DEFAULT_MAIN_SERVER,
+        help="Main DECEN server URL used by --server main.",
+    )
+    parser.add_argument(
+        "--host", default=DEFAULT_HOST, help="Local/custom server host/IP."
+    )
+    parser.add_argument(
+        "--port", default=DEFAULT_PORT, type=int, help="Local/custom server port."
+    )
     parser.add_argument("--username", help="Pre-fill the login username prompt.")
     parser.add_argument(
         "--no-animation",
